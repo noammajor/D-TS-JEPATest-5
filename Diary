@@ -1,0 +1,14 @@
+19/12/2025 - start date
+20/12/2025 - Encoder, Mask basic, Positional embedder basic, Predictor, VQ
+data loader - 
+
+
+
+tasks:
+1. preplexity fixer; if there is codebook colapse - reshuffle
+2. normalization added to VQ - need to test if actually helpful. may be killing it
+
+Points:
+1. added a normalization to the encoder - may need to remove.
+2. div factorr changed from 25 to 10 to stabalize.
+3. normalization added in the VQ, may need to remove

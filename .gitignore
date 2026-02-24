@@ -1,0 +1,29 @@
+# Data files
+data/
+
+# Model checkpoints
+output_model/
+
+# Analysis dumps
+latent_analysis/
+semantic_analysis/
+
+# Logs
+*.txt
+*.log
+perplexity_log.csv
+info.csv
+gradient_log.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
