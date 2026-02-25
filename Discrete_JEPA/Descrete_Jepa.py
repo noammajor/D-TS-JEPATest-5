@@ -403,12 +403,12 @@ class DiscreteJEPA(nn.Module):
         # Target: EMA VQ (teacher codebook, updated via momentum) on detached EMA encoder output
         _, z_s_target, _, _, _,_,_ = self.vector_quantizer_ema(z_s_target.detach())
 
-        # MLP predicts all num_patches positions; apply_mask selects the masked ones to match the target
-        pred_s2p = apply_mask(self.predictor(z_s_context, task='S2P'), masks)
+        # Predictor receives masks and directly outputs only the target positions [B*F, N_masked, D]
+        pred_s2p = self.predictor(z_s_context, task='S2P', masks=masks)
         l_s2p = F.mse_loss(pred_s2p, z_p_target.detach())
         pred_p2s = self.predictor(z_p_context, task='P2S')
         l_p2s = F.mse_loss(pred_p2s, z_s_target.detach())
-        pred_p2p = apply_mask(self.predictor(z_p_context, task='P2P'), masks)
+        pred_p2p = self.predictor(z_p_context, task='P2P', masks=masks)
         l_p2p = F.mse_loss(pred_p2p, z_p_target.detach())
         avg_soft_probs = torch.mean(probs, dim=0)
         diff_entropy = -torch.sum(avg_soft_probs * torch.log(avg_soft_probs + 1e-10))
