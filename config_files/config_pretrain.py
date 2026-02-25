@@ -33,7 +33,7 @@ config = {
     "embed_bias" : True,
     "encoder_embed_bias" : True,
     "codebook_size" : 64,
-    "commitment_cost" : 0.25,  # Reduced from 1.0: with EMA codebook updates, 0.25 is standard (VQ-VAE paper)
+    "commitment_cost" : 0.25,  # Standard VQ-VAE value: encoder commitment 4x weaker than codebook update
     "vq_ema_decay" : 0.99,  # EMA decay for codebook updates (0.99 = standard, tracks encoder output directions)
     "patch_size": 16,
     "patch_size_forcasting": 16,
@@ -59,8 +59,8 @@ config = {
     #weights for loss terms
     "lambda_weights" : {
         "P2P": 1.0,
-        "S2P": 1.0,
-        "P2S": 1.0,
+        "S2P": 2.0,   # Upweighted: S2P forces tokens to encode forecasting-relevant info
+        "P2S": 0.05,  # Nearly zero: P2S was a shortcut making tokens trivially predictable from patches
     },
     "beta_vq" : 1.0,
     "vq_warmup": 0.01,

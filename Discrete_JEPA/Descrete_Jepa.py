@@ -21,6 +21,7 @@ import torch.nn as nn
 from making_style import get_mask_style
 from Discrete_JEPA.Decoder import LinearDecoder
 from Discrete_JEPA.VQ import *
+from Discrete_JEPA.RevIN import RevIN
 
 class DiscreteJEPA(nn.Module):
     def __init__(self, config, input_dim, num_patches, steps_per_epoch, train_loader, val_loader, test_loader, forcasting_train, forcasting_val, forcasting_test):
@@ -61,7 +62,7 @@ class DiscreteJEPA(nn.Module):
             num_embeddings=config["codebook_size"],
             embedding_dim=config["encoder_embed_dim"],
             commitment_cost=config["commitment_cost"],
-            ema_decay=config.get("vq_ema_decay", 0.99)
+            decay=config.get("vq_ema_decay", 0.99),
         )
 
         for m in self.encoder.modules():
@@ -78,10 +79,9 @@ class DiscreteJEPA(nn.Module):
         self.vector_quantizer_ema.eval()  # Teacher VQ: always eval (never run EMA updates)
 
         encoder_params = list(self.encoder.parameters())
-        codebook_params = list(self.vector_quantizer.parameters())
         other_params_pred = list(self.predictor.parameters())
 
-        # Switched to AdamW for better transformer training stability
+        # Codebook is updated by EMA in VQ.forward() — not in the optimizer
         self.optimizer = torch.optim.AdamW([
             {
                 "params": encoder_params,
@@ -95,12 +95,6 @@ class DiscreteJEPA(nn.Module):
                 "weight_decay": config["weight_decay_pred"],
                 "betas": (0.9, 0.999)
             },
-            {
-                "params": codebook_params,
-                "lr": config.get("codebook_lr", config["lr"] * 2),
-                "weight_decay": 0.0,
-                "betas": (0.9, 0.999)
-            }
         ])
         self.steps_per_epoch = len(train_loader)
         self.total_steps = self.config["num_epochs"] * self.steps_per_epoch
@@ -117,7 +111,7 @@ class DiscreteJEPA(nn.Module):
         #)
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
         self.optimizer,
-        max_lr=[config["lr"], config["lr_pred"], config.get("codebook_lr", config["lr"] * 2)],
+        max_lr=[config["lr"], config["lr_pred"]],
         epochs=config["num_epochs"],
         steps_per_epoch=len(self.train_loader),
         pct_start=0.1,    # Spend 10% of time warming up
@@ -164,6 +158,7 @@ class DiscreteJEPA(nn.Module):
         self.patches_size_forecasting = config["patch_size_forcasting"]
         self.h = config["horizon_t"]
 
+        self.revin = RevIN()
         self.encoder_for = Encoder(
             num_patches=config["ratio_patches"],
             dim_in=input_dim,
@@ -173,6 +168,7 @@ class DiscreteJEPA(nn.Module):
             nhead=config["nhead"],
             num_layers=config["num_encoder_layers"],
             num_semantic_tokens=config["num_semantic_tokens"],
+            mlp_ratio=config["mlp_ratio"],
             type_enc = "target"
         )
         self.predictor_for = Predictor(
@@ -183,234 +179,15 @@ class DiscreteJEPA(nn.Module):
             config=config,
         )
 
-
-    def verify_encoder(self,model):
-        print("\n--- Encoder Integrity Check ---")
-        total_params = 0
-        for name, param in model.named_parameters():
-            p_min = param.min().item()
-            p_max = param.max().item()
-            p_mean = param.mean().item()
-            p_std = param.std().item()
-
-            # Check for NaN or Inf (The "Death" Check)
-            if torch.isnan(param).any() or torch.isinf(param).any():
-                print(f"❌ CRITICAL ERROR: {name} contains NaNs or Infs!")
-
-            # Check for Dead Layers (Zero Variance)
-            if p_std < 1e-9:
-                print(f"⚠️ WARNING: {name} appears to be dead (std ~ 0).")
-
-            # Check for Saturated Layers (Extreme values)
-            if abs(p_max) > 100 or abs(p_min) > 100:
-                print(f"⚠️ WARNING: {name} has very high magnitudes (Possible explosion).")
-
-            print(f"{name:40} | Mean: {p_mean:8.4f} | Std: {p_std:8.4f} | Range: [{p_min:6.2f}, {p_max:6.2f}]")
-        print("--- Check Complete ---\n")
-    def forcasting(self, path):
-        epoch_tag = path  # e.g. "_epoch100"
-        checkpoint_path = f"{self.path_save}{path}best_model.pt"
-        print(f"path:{checkpoint_path}")
-        name_loader = torch.load(checkpoint_path, map_location=torch.device("cpu"))
-        self.encoder_for.to(self.device)
-        self.Decoder_patches.to(self.device)
-        self.Decoder_semantic.to(self.device)
-        self.predictor_for.to(self.device)
-        self.vector_quantizer.to(self.device)
-        self.vector_quantizer_ema.to(self.device)
-        self.encoder_for.load_state_dict(name_loader["encoder"], strict=False)
-        self.predictor_for.load_state_dict(name_loader["predictor"], strict=False)
-
-        # Load vector_quantizer if available in checkpoint
-        if "vector_quantizer" in name_loader:
-            self.vector_quantizer.load_state_dict(name_loader["vector_quantizer"])
-            print("Loaded vector_quantizer (student) from checkpoint")
-        else:
-            print("Warning: vector_quantizer not found in checkpoint, using initialized weights")
-
-        # Load VQ EMA (teacher codebook)
-        if "vector_quantizer_ema" in name_loader:
-            self.vector_quantizer_ema.load_state_dict(name_loader["vector_quantizer_ema"])
-            print("Loaded vector_quantizer_ema (teacher) from checkpoint")
-        else:
-            print("Warning: vector_quantizer_ema not found in checkpoint, using student VQ weights")
-            self.vector_quantizer_ema.load_state_dict(self.vector_quantizer.state_dict())
-
-        file_keys = set(name_loader["encoder"].keys())
-        live_keys = set(self.encoder_for.state_dict().keys())
-        print(f"Missing in file: {live_keys - file_keys}")
-        print(f"Extra in file: {file_keys - live_keys}")
-        self.verify_encoder(self.encoder_for)
-
-        print(f"Loaded Encoder Weight Sum: {sum(p.sum() for p in self.encoder_for.parameters())}")
-
-        param_groups = [{"params": self.Decoder_patches.parameters()}, {"params": self.Decoder_semantic.parameters()}]
-        optimizer = torch.optim.AdamW(param_groups, lr=config["lr_forcasting"])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=max(1, self.epoch_t // 4), T_mult=1, eta_min=1e-6)
-        for epoch in range(self.epoch_t):
-            self.encoder_for.eval()
-            self.predictor_for.eval()
-            self.Decoder_patches.train()
-            self.Decoder_semantic.train()
-            total_loss=0.0
-            total_loss_sem = 0.0
-            total_loss_patch = 0.0
-            for context_patches, target_patch in self.forcast_train:
-                if context_patches.dim() == 3:
-                    context_patches = context_patches.unsqueeze(-1)
-                # Move data to device
-                context_patches = context_patches.to(self.device)
-                target_patch = target_patch.to(self.device)
-                optimizer.zero_grad()
-                with torch.no_grad():
-                    encoder_out = self.encoder_for(context_patches)
-                    encoder_patches = encoder_out["data_patches"]
-                    encoder_semantic = encoder_out["quantized_semantic"]
-                    vq_loss, encoder_semantic,soft_probs,perplexity, indices, _, _ = self.vector_quantizer(encoder_semantic)
-                    print(f"{encoder_patches.mean().item():.4f}, mean semantic:{encoder_semantic.mean().item():.4f}")
-                    enc_std=encoder_patches.std(dim=-1, keepdim=True, correction=0).mean().item()
-                    enc_s_std = encoder_semantic.std(dim=-1, keepdim=True, correction=0).mean().item()
-                    predicted_latent_patch = self.predictor_for(encoder_patches, target_mask=None, task='P2P')
-                    predicted_latent_semantic = self.predictor_for(encoder_semantic, target_mask=None, task='P2S')
-                    predicted_patches_from_semantic = self.predictor_for(encoder_semantic, target_mask=None, task='S2P')
-                predicted_next_patch = self.Decoder_patches(predicted_latent_patch)
-                predicted_next_tokenic = self.Decoder_semantic(predicted_latent_semantic)
-                predicted_next_patch_from_semantic = self.Decoder_patches(predicted_patches_from_semantic)
-                loss_sem = torch.nn.functional.mse_loss(predicted_next_patch_from_semantic, target_patch)
-                loss_patch = torch.nn.functional.mse_loss(predicted_next_patch, target_patch)
-                total_loss_sem += loss_sem
-                total_loss_patch += loss_patch
-                loss = loss_sem + loss_patch
-                total_loss += loss
-                loss.backward()
-                optimizer.step()
-            scheduler.step()
-            if epoch % 10 == 0:
-                print(f"Epoch: {epoch} - Training Loss: {total_loss/len(self.forcast_train)}")
-        predictions_p2p = []
-        predictions_s2p = []
-        predictions_p2s = []
-        total_context_steps = self.Context_t * self.patches_size_forecasting
-        test_series = self.forcast_test.dataset.series[:total_context_steps]
-
-        current_context = (
-            test_series
-            .reshape(self.patches_size_forecasting, self.Context_t, 1)
-            .unsqueeze(0)
-            .to(self.device)
-            .float()
-        )
-        
-        self.encoder_for.eval()
-        self.Decoder_patches.eval()
-        self.Decoder_semantic.eval()
-        self.predictor_for.eval()
-
-        with torch.no_grad():
-            for step in range(self.Patches_to_forcast):
-                encoder_out = self.encoder_for(current_context)
-                encoder_patches = encoder_out["data_patches"]
-                encoder_semantic = encoder_out["quantized_semantic"]
-                vq_loss, encoder_semantic,soft_probs,perplexity, indices,_,_ = self.vector_quantizer(encoder_semantic)
-                #predict
-                predicted_latent_patch = self.predictor_for(encoder_patches, target_mask=None, task='P2P')
-                predicted_latent_semantic = self.predictor_for(encoder_patches, target_mask=None, task='P2S')
-                predicted_latent_s2p = self.predictor_for(encoder_semantic, target_mask=None, task='S2P')
-                #vals
-                predicted_next_patch = self.Decoder_patches(predicted_latent_patch)
-                predicted_next_tokenic = self.Decoder_semantic(predicted_latent_semantic)
-                predicted_next_patch_from_semantic = self.Decoder_patches(predicted_latent_s2p)
-                # 4. Store for comparison graphs
-                predictions_p2s.append(predicted_next_tokenic.squeeze(0).cpu())
-                predictions_s2p.append(predicted_next_patch_from_semantic.squeeze(0).cpu())
-                predictions_p2p.append(predicted_next_patch.squeeze(0).cpu())
-                time_step_patch = predicted_next_patch[:, 0, :]
-                time_step_patch = time_step_patch.unsqueeze(1).unsqueeze(-1)
-                current_context = torch.cat([current_context[:, 1:], time_step_patch], dim=1)
-
-        predict_p2p = torch.cat(predictions_p2p, dim=0)
-        predict_p2s = torch.cat(predictions_p2s, dim=0)
-        predict_s2p = torch.cat(predictions_s2p, dim=0)
-
-        test_series = self.forcast_test.dataset.series
-
-        # 2. Define the window for ground truth
-        # The context used the first 320 steps (Context_t * Patches_t)
-        # So the real future starts at index 320
-        start_idx = self.Context_t * self.patches_size_forecasting
-        total_forecasted_steps = predict_p2p.shape[0] * self.patches_size_forecasting
-        end_idx = start_idx + total_forecasted_steps
-
-        # 3. Extract the real values and move them to your device
-        # .squeeze() ensures it's a flat 1D line for plotting
-        real_values = test_series[start_idx:end_idx].to(self.device)
-        predict_p2p = predict_p2p.reshape(-1)
-        predict_s2p = predict_s2p.reshape(-1)
-        truth_np = real_values.cpu().numpy()
-
-        loss_test_p2p = torch.nn.functional.mse_loss(predict_p2p, real_values.cpu())
-        #loss_test_p2s = torch.nn.functional.mse_loss(predict_p2s, real_values.cpu())
-        loss_test_s2p = torch.nn.functional.mse_loss(predict_s2p, real_values.cpu())
-        num_s = self.Patches_to_forcast * self.patches_size_forecasting
-        print(f"Test MSE Loss - Patch-to-Patch (P2P): {loss_test_p2p.item()}, loss normalized per step: {loss_test_p2p.item()/num_s}")
-        #print(f"Test MSE Loss - Patch-to-Sequence (P2S): {loss_test_p2s.item()}")
-        print(f"Test MSE Loss - Sequence-to-Patch (S2P): {loss_test_s2p.item()}, loss normalized per step: {loss_test_p2p.item()/num_s}")
-
-        # 2. Update dictionary with parentheses in every key to satisfy .split('(')
-        predict_types = {
-            "Raw Patch-to-Patch (P2P)": predict_p2p.cpu().numpy(),
-            "Raw Sequence-to-Patch (S2P)": predict_s2p.cpu().numpy(),
-        }
-        
-        colors = ['green', 'red']
-        
-        for (title, pred_data), color in zip(predict_types.items(), colors):
-            plt.figure(figsize=(15, 5))
-            
-            # Use Normalized Truth if the title says "Normalized", else use Raw Truth
-            plt.plot(truth_np, label='Raw Ground Truth', color='black', alpha=0.5, linewidth=2)
-            plt.ylabel("Original OT Value")
-
-            # Plot Prediction
-            plt.plot(pred_data, label=f'TS-JEPA {title}', color=color, linestyle='--', alpha=0.9)
-            
-            plt.title(f"Comparison: {title}")
-            plt.xlabel("Future Time Steps (720 Horizon)")
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.5)
-            
-            # This will now work for all 4 keys!
-            # It extracts 'p2p' or 's2p' from the parentheses
-            slug = title.split('(')[1][:3].lower()
-            
-            # Add a prefix so 'Raw' and 'Normalized' don't overwrite each other
-            prefix = "norm" if "Normalized" in title else "raw"
-            save_name = f"compare_{prefix}_{slug}{epoch_tag}.png"
-            path_s = os.path.join(self.path_save, "output_model")
-
-            # 2. CRITICAL: Create the directory if it doesn't exist
-            # Without this, savefig will throw a FileNotFoundError
-            os.makedirs(path_s, exist_ok=True)
-            full_save_path = os.path.join(path_s, save_name)
-            # 4. Save the figure
-            plt.savefig(full_save_path)
-            plt.close()
-
     def forcasting_zeroshot(self, path):
         """Non-autoregressive forecasting: slides real context forward, no prediction feedback.
         Runs TWICE: first with random encoder (baseline), then with trained encoder."""
         epoch_tag = path
         checkpoint_path = f"{self.path_save}{path}best_model.pt"
 
-        # Load checkpoint for normalization stats and later use
         name_loader = torch.load(checkpoint_path, map_location=torch.device("cpu"))
-
-        # Data is normalized by the dataset's StandardScaler — no model-level stats needed
-
-        # Run twice: random encoder, then trained encoder
-        for run_type in ['RANDOM', 'TRAINED']:
+        for run_type in ['TRAINED']:
             print(f"\n=== Zero-Shot Forecasting ({run_type}) ===")
-
             # Move models to device
             self.encoder_for.to(self.device)
             self.vector_quantizer.to(self.device)
@@ -429,8 +206,6 @@ class DiscreteJEPA(nn.Module):
                     self.vector_quantizer_ema.load_state_dict(self.vector_quantizer.state_dict())
             # For RANDOM: models already randomly initialized from __init__
             else:
-                # Re-initialize to fresh random weights every time
-                # (previous TRAINED run overwrites these, so we must reset)
                 for m in self.encoder_for.modules():
                     if hasattr(m, 'reset_parameters'):
                         m.reset_parameters()
@@ -470,20 +245,21 @@ class DiscreteJEPA(nn.Module):
                     target_patch = target_patch.to(self.device)
                     B, h_t, P_L, n_v = target_patch.shape
                     target_patch = target_patch.permute(0, 3, 1, 2).reshape(B * n_v, h_t, P_L)
+                    # RevIN: normalize context per variable, get stats for target normalization
+                    context_norm, revin_mu, revin_sigma = self.revin.normalize(context_patches)
                     optimizer.zero_grad()
                     with torch.no_grad():
-                        encoder_out = self.encoder_for(context_patches)
+                        encoder_out = self.encoder_for(context_norm)
                         encoder_patches = encoder_out["data_patches"]
                         encoder_semantic = encoder_out["quantized_semantic"]
                         vq_loss, encoder_semantic, soft_probs, perplexity, indices,_,_ = self.vector_quantizer(encoder_semantic)
-                        # No predictor: flatten full context → single linear layer
-                        flat_patch = encoder_patches.flatten(1)    # [B*n_v, ratio_patches * embed_dim]
-                        flat_sem = encoder_semantic.flatten(1)      # [B*n_v, num_sem_tokens * embed_dim]
+                        flat_patch = encoder_patches.flatten(1)
+                        flat_sem = encoder_semantic.flatten(1)
                     pred_patch = head_patch(flat_patch).view(B * n_v, h, self.patches_size_forecasting)
                     pred_s2p = head_sem(flat_sem).view(B * n_v, h, self.patches_size_forecasting)
-
-                    
-                    loss = F.mse_loss(pred_patch, target_patch) + F.mse_loss(pred_s2p, target_patch)
+                    # Normalize target with context RevIN stats so head trains in RevIN space
+                    target_revin = RevIN.normalize_target(target_patch, revin_mu, revin_sigma)
+                    loss = F.mse_loss(pred_patch, target_revin) + F.mse_loss(pred_s2p, target_revin)
                     total_loss += loss.item()
                     loss.backward()
                     optimizer.step()
@@ -491,10 +267,7 @@ class DiscreteJEPA(nn.Module):
                 if epoch % 10 == 0:
                     print(f"[{run_type}] Epoch: {epoch} - Loss: {total_loss/len(self.forcast_train):.4f}")
 
-            # --- Zero-shot inference: no autoregressive feedback ---
-            num_ctx = self.patches_size_forecasting
-            data_pp = self.Context_t #patches
-
+            # --- Zero-shot inference ---
             self.encoder_for.eval()
             head_patch.eval()
             head_sem.eval()
@@ -506,42 +279,42 @@ class DiscreteJEPA(nn.Module):
                     B, h_t, P_L, n_v = target_patch.shape
                     target_patch = target_patch.permute(0, 3, 1, 2).reshape(B * n_v, h_t, P_L)
                     target_patch_normalizes = target_patch
-                    # Target is strictly after context — full context is visible
-                    encoder_out = self.encoder_for(context_patches)
+                    # RevIN: normalize context, keep stats for denormalization
+                    context_norm, revin_mu, revin_sigma = self.revin.normalize(context_patches)
+                    encoder_out = self.encoder_for(context_norm)
                     encoder_patches = encoder_out["data_patches"]
                     encoder_semantic = encoder_out["quantized_semantic"]
                     vq_loss, encoder_semantic, soft_probs, perplexity, indices,_,_ = self.vector_quantizer(encoder_semantic)
-                    # No predictor: flatten full context → linear heads
                     flat_patch = encoder_patches.flatten(1)
                     flat_sem = encoder_semantic.flatten(1)
                     pred_p2p = head_patch(flat_patch).view(B * n_v, h, self.patches_size_forecasting)
                     pred_s2p = head_sem(flat_sem).view(B * n_v, h, self.patches_size_forecasting)
+                    # Denormalize predictions back to StandardScaler space for metric comparison
+                    pred_p2p = RevIN.denormalize(pred_p2p, revin_mu, revin_sigma)
+                    pred_s2p = RevIN.denormalize(pred_s2p, revin_mu, revin_sigma)
                     break
                 else:
                     print(f"WARNING: forcast_test is empty (len={len(self.forcast_test.dataset)}), skipping evaluation.")
                     continue
 
-            # target_patch: [B, h, P_L, n_vars] (4D from dataloader)
-            # pred_p2p / pred_s2p: [B*n_vars, h, P_L] (3D from channel-independence encoder+decoder)
-            B, n_vars = 32, 21
+            B, n_vars = self.config["batch_size"], len(self.config["input_variables_forcasting"][0])
             h_t, P_L = self.h, self.patches_size_forecasting
             pred_p2p_4d = pred_p2p.view(B, n_vars, h_t, P_L)
             pred_s2p_4d = pred_s2p.view(B, n_vars, h_t, P_L)
-            # Reshape predictions: [B*n_vars, h, P_L] → [B, n_vars, h, P_L]
             pred_p2p_4d = pred_p2p.view(B, n_vars, h_t, P_L)
             pred_s2p_4d = pred_s2p.view(B, n_vars, h_t, P_L)
-            target_norm_4d = target_patch_normalizes.view(B, n_vars, h_t, P_L)  # [B, n_vars, h, P_L]
-            target_4d = target_patch.view(B, n_vars, h_t, P_L)            # [B, n_vars, h, P_L]
-
-            # Aggregate MSE over all samples and variables
+            target_norm_4d = target_patch_normalizes.view(B, n_vars, h_t, P_L)
+            target_4d = target_patch.view(B, n_vars, h_t, P_L)
             norm_lossP2P = F.mse_loss(pred_p2p_4d.cpu(), target_norm_4d.cpu())
             norm_lossS2P = F.mse_loss(pred_s2p_4d.cpu(), target_norm_4d.cpu())
+            mae_lossP2P = F.l1_loss(pred_p2p_4d.cpu(), target_norm_4d.cpu())
+            mae_lossS2P = F.l1_loss(pred_s2p_4d.cpu(), target_norm_4d.cpu())
             mix_4d = (pred_p2p_4d + pred_s2p_4d) / 2.0
             norm_mixloss = F.mse_loss(mix_4d.cpu(), target_norm_4d.cpu())
+            mae_mixloss = F.l1_loss(mix_4d.cpu(), target_norm_4d.cpu())
             num_s = h * self.patches_size_forecasting
-            print(f"[{run_type}] Test MSE P2P Norm:{norm_lossP2P.item():.4f}, Test MSE S2P Norm:{norm_lossS2P.item():.4f}, mix: {norm_mixloss.item():.4f}")
-
-            # Plot each variable separately for the first sample in the batch
+            print(f"[{run_type}] MSE  — P2P: {norm_lossP2P.item():.4f}, S2P: {norm_lossS2P.item():.4f}, mix: {norm_mixloss.item():.4f}")
+            print(f"[{run_type}] MAE  — P2P: {mae_lossP2P.item():.4f}, S2P: {mae_lossS2P.item():.4f}, mix: {mae_mixloss.item():.4f}")
             sample = 0
             path_s = os.path.join(self.path_save, "output_model")
             os.makedirs(path_s, exist_ok=True)
@@ -568,8 +341,6 @@ class DiscreteJEPA(nn.Module):
                 plt.close()
 
             print(f"[{run_type}] Plots saved to {os.path.join(self.path_save, 'output_model')}")
-
-
 
     def compute_var_loss(self, z):
         eps = 1e-4
@@ -651,8 +422,9 @@ class DiscreteJEPA(nn.Module):
             lambda_weights["P2S"] * l_p2s +
             1.0 * beta_vq * l_vq +
             0.5 * l_preplexity +
-            0.30*token_div_loss+
-            0.35 * (var_loss_context_token+var_loss_context_patch+cov_loss_context_patch+ cov_loss_context_token)
+            0.60 * token_div_loss +  # Increased: cov[tok] was 0.7-0.8, tokens not diversifying
+            0.15 * (var_loss_context_patch + cov_loss_context_patch) +  # patch vicreg (lighter)
+            0.60 * (var_loss_context_token + cov_loss_context_token)    # token vicreg (stronger)
         )
         if batch_idx % 5 == 0:
             print(f"TOTAL: {total_loss.item():.4f} | P2P: {l_p2p.item():.4f}, S2P: {l_s2p.item():.4f}, P2S: {l_p2s.item():.4f}, VQ: {l_vq.item():.4f}, Perp: {l_preplexity:.4f}, TokDiv: {token_div_loss.item():.4f}")
@@ -674,7 +446,7 @@ class DiscreteJEPA(nn.Module):
         self.encoder.eval()
         self.encoder_ema.eval()
         self.predictor.eval()
-        self.vector_quantizer.eval()  # Disable EMA codebook updates during validation
+        self.vector_quantizer.eval()
         val_loss = 0.0
         val_metrics = {'l_s2p': 0.0, 'l_p2s': 0.0, 'l_p2p': 0.0, 'l_vq': 0.0, 'l_preplexity': 0.0,'var_loss_context_patch': 0.0, 
         'var_loss_context_token': 0.0, 'cov_loss_context_patch':0.0, 'cov_loss_context_token':0.0}
@@ -682,10 +454,11 @@ class DiscreteJEPA(nn.Module):
             for patches, masks, non_masks in val_loader:
 
                 patches, masks, non_masks = patches.to(self.device), masks.to(self.device), non_masks.to(self.device)
+                patches, _, _ = self.revin.normalize(patches)  # RevIN: per-variable normalization
 
                 target_out = self.encoder_ema(patches)
                 target_out = apply_mask(target_out, masks)
-                
+
                 context_out = self.encoder(patches, mask=non_masks)
                 loss, loss_dict = self.compute_discrete_jepa_loss(
                     context_out,
@@ -732,15 +505,6 @@ class DiscreteJEPA(nn.Module):
         except Exception as e:
             print(f"Problem saving checkpoint: {e}")
 
-    # we can use diffrent one - this is TS_JEPA basic
-    def lr_lambda(self, epoch):
-        start_lr = self.config["lr"]
-        end_lr = self.config["end_lr"]
-        if epoch < self.config["num_epochs"]:
-            return start_lr + (end_lr - start_lr) * (epoch / (self.config["num_epochs"] - 1))
-        else:
-            return end_lr
-
     def train_and_evaluate(self):
         self.encoder = self.encoder.to(self.device)
         self.predictor = self.predictor.to(self.device)
@@ -755,14 +519,6 @@ class DiscreteJEPA(nn.Module):
         num_batches = self.steps_per_epoch
         best_val_loss = float("inf")
         total_loss, total_var_encoder, total_var_decoder = 0.0, 0.0, 0.0
-        print("=" * 60)
-        print(f"DATASET INFO:")
-        print(f"  Train samples: {len(self.train_loader.dataset):,}")
-        print(f"  Val samples:   {len(self.val_loader.dataset):,}")
-        print(f"  Test samples:  {len(self.test_loader.dataset):,}")
-        print(f"  Batch size:    {self.config['batch_size']}")
-        print(f"  Steps/epoch:   {len(self.train_loader)}")
-        print("=" * 60)
         self.save_model(self.encoder, self.encoder_ema, self.predictor, self.optimizer, 0, f"{self.path_save}_INITIAL")
         current_global_step = 0
         # Training Loop
@@ -770,13 +526,14 @@ class DiscreteJEPA(nn.Module):
             print(f"Starting Epoch {epoch}/{self.config['num_epochs']}")
             self.encoder.train()
             self.predictor.train()
-            self.vector_quantizer.train()  # Enable EMA codebook updates during training
+            self.vector_quantizer.train()
             running_loss = 0.0
 
             for batch_idx, (patches, masks, non_masks) in enumerate(self.train_loader):
                 self.optimizer.zero_grad()
                 m = next(self.ema_scheduler)
                 patches = patches.to(self.device)
+                patches, _, _ = self.revin.normalize(patches)  # RevIN: per-variable normalization
 
                 current_global_step += 1
                 with torch.no_grad():
@@ -806,9 +563,11 @@ class DiscreteJEPA(nn.Module):
                 with torch.no_grad():
                     for p, p_ema in zip(self.encoder.parameters(), self.encoder_ema.parameters()):
                         p_ema.data.mul_(m).add_((1.0-m)*p.detach().data)
-                    # VQ EMA update (teacher codebook tracks student codebook)
-                    for p, p_ema in zip(self.vector_quantizer.parameters(), self.vector_quantizer_ema.parameters()):
-                        p_ema.data.mul_(m).add_((1.0-m)*p.detach().data)
+                    # Sync teacher VQ codebook from student
+                    # (student codebook is EMA-updated in forward; teacher gets a momentum copy)
+                    self.vector_quantizer_ema._embedding.weight.data.mul_(m).add_(
+                        (1.0 - m) * self.vector_quantizer._embedding.weight.data
+                    )
                 
                 running_loss += loss.item()
 
