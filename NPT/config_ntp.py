@@ -1,0 +1,49 @@
+config = {
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    "pretrain_dataset":  "monash",
+    "forecast_dataset":  "ettm1",
+
+    # ── Monash pretraining ────────────────────────────────────────────────────
+    "monash_data_dir":   "/home/shared/datasets/Monash",
+    "monash_min_len":    512,
+
+    # ── Patching (JEPA-style data loader) ─────────────────────────────────────
+    # patch_size  = length of each patch (≡ patch_len in PatchTST)
+    # ratio_patches = number of patches per window (context = patch_size * ratio_patches)
+    "patch_size":     12,
+    "ratio_patches":  42,   # 12 * 42 = 504 ≈ 512 context window
+    "masking_type":   "random",   # required by data loader; not used in NTP loss
+    "mask_ratio":     0.4,
+    "num_blocks":     1,
+    "val_prec":       0.1,
+    "test_prec":      0.1,
+
+    # ── Model ─────────────────────────────────────────────────────────────────
+    "n_layers":     3,
+    "n_heads":      16,
+    "d_model":      128,
+    "d_ff":         512,
+    "dropout":      0.2,
+    "head_dropout": 0.2,
+    "act":          "gelu",
+
+    # ── Training ──────────────────────────────────────────────────────────────
+    "num_epochs":    50,
+    "batch_size":    64,
+    "lr":            1e-4,
+    "revin":         True,
+    "num_workers":   0,
+
+    # ── Zero-Shot Forecasting ─────────────────────────────────────────────────
+    # horizon_t          = number of future patches to forecast
+    # patch_size_forcasting is automatically set to patch_size at runtime
+    "horizon_t":              4,     # 4 patches × 12 = 48-step horizon
+    "val_prec_forcasting":    0.1,
+    "test_prec_forcasting":   0.1,
+    "window_step_forecasting": 1,    # stride between forecasting windows
+    "lr_forcasting":          1e-4,
+    "epochs_forecasting":     20,
+
+    # ── Misc ──────────────────────────────────────────────────────────────────
+    "pretrained_model_id": 1,
+}

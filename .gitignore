@@ -1,0 +1,34 @@
+# Data directories
+Discrete_JEPA/data - forecasting timeseries/
+TSDiNO/UCI HAR Dataset/
+Monash/*.tsf
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.env/
+env/
+
+# Model checkpoints / large binaries
+*.pt
+*.pth
+*.bin
+*.h5
+*.pkl
+*.npy
+*.npz
+
+# CSV / data files
+*.csv
+*.parquet
